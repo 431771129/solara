@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["patch_base64", "summary", "evidence", "no_change_reason"],
+  "properties": {
+    "patch_base64": { "type": "string" },
+    "summary": { "type": "string" },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "no_change_reason": { "type": "string" }
+  }
+}
