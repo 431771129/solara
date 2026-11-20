@@ -11,3 +11,7 @@ server/node_modules/
 # Local backups and temporary scripts
 *.backup.js
 
+# Offline development and untrusted AI scratch output
+node_modules/
+/.ai-work/
+**/__pycache__/
