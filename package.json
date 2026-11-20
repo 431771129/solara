@@ -1,0 +1,12 @@
+{
+  "name": "solara-development",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free offline checks for Solara",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "check": "node tools/check.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "verify": "npm run check && npm test"
+  }
+}

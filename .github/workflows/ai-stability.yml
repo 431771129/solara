@@ -1,0 +1,232 @@
+name: Bounded stability candidate
+
+# Manual trial ONLY. No schedule, automatic merging or publishing.
+on:
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: solara-ai-stability
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: vars.SOLARA_AI_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+      base_branch: ${{ steps.base.outputs.branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Pin default branch and bound open AI PRs
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_REF: ${{ github.ref }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, urllib.request
+          def get(path):
+              req = urllib.request.Request('https://api.github.com/'+path, headers={
+                  'Authorization': 'Bearer '+os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'User-Agent': 'solara-ci'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          repo = os.environ['REPO']
+          branch = get('repos/'+repo)['default_branch']
+          if os.environ['CURRENT_REF'] != 'refs/heads/'+branch:
+              raise SystemExit('Dispatch only from the default branch')
+          pending = 0
+          for page in range(1, 11):
+              prs = get('repos/'+repo+'/pulls?state=open&per_page=100&page='+str(page))
+              pending += sum(pr['head']['ref'].startswith('ai/stability-') for pr in prs)
+              if pending >= 2:
+                  raise SystemExit('Two AI PRs already await review; stop')
+              if len(prs) < 100:
+                  break
+          else:
+              raise SystemExit('Too many PRs to safely enumerate')
+          sha = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          if not re.fullmatch('[0-9a-f]{40}',sha):
+              raise SystemExit('Invalid base SHA')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              out.write('sha='+sha+'\nbranch='+branch+'\n')
+          PY
+      - name: Establish a green offline baseline
+        run: npm run verify
+
+  propose:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    permissions:
+      contents: read
+    outputs:
+      proposal: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Validate configured endpoint and secret presence without printing secrets
+        env:
+          MODEL_KEY: ${{ secrets.MODEL_API_KEY }}
+          RESPONSES_ENDPOINT: ${{ vars.SOLARA_AI_RESPONSES_ENDPOINT }}
+          MODEL: ${{ vars.SOLARA_AI_MODEL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          url = urllib.parse.urlsplit(os.environ['RESPONSES_ENDPOINT'])
+          if not os.environ['MODEL_KEY'] or not os.environ['MODEL'].strip():
+              raise SystemExit('Configure MODEL_API_KEY and SOLARA_AI_MODEL first')
+          if url.scheme != 'https' or not url.hostname or url.username or url.password or url.fragment:
+              raise SystemExit('Configure a trusted HTTPS Responses endpoint without embedded credentials')
+          if not url.path.rstrip('/').endswith('/responses'):
+              raise SystemExit('Use the full Responses URL ending in /responses')
+          print('Model configuration present; no API request has been sent by preflight.')
+          PY
+      # LAST STEP: no privileged action or upload runs after the agent on this runner.
+      - name: Propose one patch in a restricted workspace
+        id: codex
+        timeout-minutes: 12
+        uses: openai/codex-action@306c6a196a99dcc6582530c396a19d2672d5e9ec # v1
+        with:
+          openai-api-key: ${{ secrets.MODEL_API_KEY }}
+          responses-api-endpoint: ${{ vars.SOLARA_AI_RESPONSES_ENDPOINT }}
+          model: ${{ vars.SOLARA_AI_MODEL }}
+          codex-version: '0.171.0'
+          permission-profile: ':workspace'
+          safety-strategy: drop-sudo
+          effort: medium
+          prompt-file: .github/prompts/stability.md
+          output-schema-file: .github/prompts/stability-schema.json
+
+  verify:
+    needs: [prepare, propose]
+    if: needs.propose.outputs.proposal != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    outputs:
+      has_patch: ${{ steps.decode.outputs.has_patch }}
+      patch_sha256: ${{ steps.digest.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Decode output as untrusted data
+        id: decode
+        env:
+          AI_RESULT: ${{ needs.propose.outputs.proposal }}
+        run: python3 tools/ai_handoff.py decode --out .ai-work/verified
+      - name: Independently reject out-of-scope changes
+        if: steps.decode.outputs.has_patch == 'true'
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          python3 tools/ai_guard.py apply --base "$BASE_SHA" --patch .ai-work/verified/candidate.patch
+          # Guard stages only. Materialize validated bytes so tests exercise the candidate, not BASE.
+          git -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout-index --all --force
+      - name: Freeze patch digest before any candidate code runs
+        id: digest
+        if: steps.decode.outputs.has_patch == 'true'
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          sha = hashlib.sha256(pathlib.Path('.ai-work/verified/candidate.patch').read_bytes()).hexdigest()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('sha='+sha+'\n')
+          PY
+      - name: Run frozen checks without model or writer credentials
+        if: steps.decode.outputs.has_patch == 'true'
+        run: |
+          npm run verify
+          git diff --cached --check
+      - name: Retain verified data only
+        if: steps.decode.outputs.has_patch == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stability-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ai-work/verified/candidate.patch
+            .ai-work/verified/report.json
+          include-hidden-files: true
+          retention-days: 3
+          if-no-files-found: error
+
+  publish-draft:
+    needs: [prepare, verify]
+    if: needs.verify.outputs.has_patch == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stability-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ai-work/incoming
+      - name: Revalidate verified bytes in a fresh trusted writer
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          EXPECTED_SHA: ${{ needs.verify.outputs.patch_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re
+          p = pathlib.Path('.ai-work/incoming/candidate.patch')
+          expected = os.environ['EXPECTED_SHA']
+          if not re.fullmatch('[0-9a-f]{64}', expected) or p.is_symlink() or p.stat().st_size > 65536:
+              raise SystemExit('Invalid candidate artifact')
+          if hashlib.sha256(p.read_bytes()).hexdigest() != expected:
+              raise SystemExit('Candidate changed after independent validation')
+          PY
+          python3 tools/ai_guard.py apply --base "$BASE_SHA" --patch .ai-work/incoming/candidate.patch
+      # Do not run application code, new tests, npm, hooks or arbitrary model text here.
+      - name: Push an isolated branch and open a draft PR only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          BASE_BRANCH: ${{ needs.prepare.outputs.base_branch }}
+          AI_BRANCH: ai/stability-${{ github.run_id }}-${{ github.run_attempt }}
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_VALUE_0: /dev/null
+          GIT_CONFIG_KEY_1: core.fsmonitor
+          GIT_CONFIG_VALUE_1: 'false'
+        run: |
+          git -c core.hooksPath=/dev/null switch -c "$AI_BRANCH"
+          git -c core.hooksPath=/dev/null -c user.name='solara-stability[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: propose offline-verified frontend stability change'
+          python3 - <<'PY'
+          import base64, os, pathlib, subprocess, sys
+          # Pass authentication via process environment, never command args or a remote URL.
+          credential = base64.b64encode(('x-access-token:'+os.environ['GH_TOKEN']).encode()).decode()
+          env = os.environ.copy()
+          env.update(GIT_CONFIG_COUNT='3',
+                     GIT_CONFIG_KEY_2='http.https://github.com/.extraheader',
+                     GIT_CONFIG_VALUE_2='AUTHORIZATION: basic '+credential)
+          subprocess.run(['git','push','origin','HEAD:refs/heads/'+os.environ['AI_BRANCH']], env=env, check=True)
+          subprocess.run([sys.executable,'tools/ai_handoff.py','open-pr','--report','.ai-work/incoming/report.json'], check=True)
+          PY
